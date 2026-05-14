@@ -72,7 +72,7 @@ def call_mimo(user_message):
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "MiniMax-Text-01",
+        "model": "mimo-v2.5-pro",
         "messages": [
             {
                 "role": "system",
