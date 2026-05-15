@@ -2,96 +2,98 @@
 # -*- coding: utf-8 -*-
 """
 微信公众号 AI 对话机器人 - 基于 Mimo API
-功能：接收用户消息 → 调用 Mimo → 回复给用户
 """
 
 import os
 import time
 import hashlib
+import logging
 import requests
+from collections import defaultdict, deque
 from flask import Flask, request, make_response
 from xml.etree import ElementTree as ET
 
-# ========== 配置区（必须设置的环境变量）==========
-# Railway 环境变量
-WECHAT_TOKEN = os.environ.get("WECHAT_TOKEN", "")       # ★ 微信 Token，必须跟公众号后台一致
-WECHAT_APPID = os.environ.get("WECHAT_APPID", "")       # AppID（只在需要时用）
-WECHAT_ORIGINAL_ID = os.environ.get("WECHAT_ORIGINAL_ID", "")  # ★ 原始ID（gh_xxxxx），回复时用作 FromUserName
+# ========== 日志配置 ==========
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# ========== 环境变量 ==========
+WECHAT_TOKEN = os.environ.get("WECHAT_TOKEN", "")
+WECHAT_ORIGINAL_ID = os.environ.get("WECHAT_ORIGINAL_ID", "")
 
 MIMO_API_URL = os.environ.get("MIMO_API_URL", "https://token-plan-sgp.xiaomimimo.com/v1/chat/completions")
 MIMO_API_KEY = os.environ.get("MIMO_API_KEY", "")
-MIMO_TIMEOUT = int(os.environ.get("MIMO_TIMEOUT", "8"))  # Mimo API 超时秒数（微信限制5s，留点余量）
+MIMO_TIMEOUT = int(os.environ.get("MIMO_TIMEOUT", "4"))  # ← 4秒，给微信留1秒余量
 
 BOT_NAME = os.environ.get("BOT_NAME", "小爪AI")
-# ============================
+MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "10"))   # 每用户保留最近10条（≈5轮对话）
 
 app = Flask(__name__)
+
+# ========== 多轮对话记忆（内存版，重启丢失） ==========
+# key: from_user(openid), value: deque of {"role": ..., "content": ...}
+user_histories: dict[str, deque] = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
+
+# ========== 消息去重（防微信重试） ==========
+# 简单 set，重启清空；生产环境可换 Redis + TTL
+processed_msg_ids: set[str] = set()
 
 
 # ---------- 签名验证 ----------
 
-def generate_sign(timestamp, nonce):
-    """生成微信签名"""
-    l = [WECHAT_TOKEN, timestamp, nonce]
-    l.sort()
-    return hashlib.sha1("".join(l).encode()).hexdigest()
-
-
-def verify_wechat():
-    """验证微信服务器"""
+def verify_wechat() -> bool:
     signature = request.args.get("signature", "")
     timestamp = request.args.get("timestamp", "")
     nonce = request.args.get("nonce", "")
-
-    if not signature or not timestamp or not nonce:
+    if not all([signature, timestamp, nonce]):
         return False
-
-    s = sorted([WECHAT_TOKEN, timestamp, nonce])
-    real_sig = hashlib.sha1("".join(s).encode()).hexdigest()
+    real_sig = hashlib.sha1("".join(sorted([WECHAT_TOKEN, timestamp, nonce])).encode()).hexdigest()
     return real_sig == signature
 
 
 # ---------- 回复构建 ----------
 
-def safe_xml_escape(text):
-    """安全的 XML 内容转义（防止花括号/特殊字符破坏格式）"""
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+def safe_cdata(text: str) -> str:
+    """CDATA 不需要转义，但防止 ]]> 破坏 XML 结构"""
+    return text.replace("]]>", "]]]]><![CDATA[>")
 
 
-def reply_text(to_user, content):
-    """生成微信文本回复 XML（使用原始ID作为FromUserName）"""
-    from_user = WECHAT_ORIGINAL_ID or WECHAT_APPID
-    safe_content = safe_xml_escape(content)
+def reply_text(to_user: str, content: str) -> str:
     return f"""<xml>
 <ToUserName><![CDATA[{to_user}]]></ToUserName>
-<FromUserName><![CDATA[{from_user}]]></FromUserName>
+<FromUserName><![CDATA[{WECHAT_ORIGINAL_ID}]]></FromUserName>
 <CreateTime>{int(time.time())}</CreateTime>
 <MsgType><![CDATA[text]]></MsgType>
-<Content><![CDATA[{safe_content}]]></Content>
+<Content><![CDATA[{safe_cdata(content)}]]></Content>
 </xml>"""
 
 
 # ---------- Mimo API ----------
 
-def call_mimo(user_message):
-    """调用 Mimo API 生成回复（纯文本）"""
+SYSTEM_PROMPT = (
+    f"你是一个友好的AI助手，名字叫{BOT_NAME}。"
+    "你在微信公众号里和用户对话，请用简洁口语化的方式回复，每次不超过200字。"
+)
+
+
+def call_mimo(from_user: str, user_message: str) -> str:
+    """调用 Mimo，携带该用户的历史对话（多轮记忆）"""
+    history = list(user_histories[from_user])
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": user_message})
+
     headers = {
         "Authorization": f"Bearer {MIMO_API_KEY}",
         "Content-Type": "application/json"
     }
     payload = {
         "model": "mimo-v2.5",
-        "messages": [
-            {
-                "role": "system",
-                "content": f"你是一个友好的AI助手，名字叫{BOT_NAME}。你正在一个微信公众号里和用户对话。"
-                           f"请用简洁、有趣、口语化的方式回复用户。每次回复不要太长，最好在200字以内。"
-            },
-            {
-                "role": "user",
-                "content": user_message
-            }
-        ],
+        "messages": messages,
         "max_tokens": 500,
         "temperature": 0.8
     }
@@ -100,40 +102,36 @@ def call_mimo(user_message):
         resp = requests.post(MIMO_API_URL, headers=headers, json=payload, timeout=MIMO_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
-        if "choices" in data and len(data["choices"]) > 0:
-            return data["choices"][0]["message"]["content"]
-        return str(data) if data else "小爪没想好怎么回，换个问题试试？😄"
+        reply = data["choices"][0]["message"]["content"]
+
+        # 保存本轮到记忆
+        user_histories[from_user].append({"role": "user", "content": user_message})
+        user_histories[from_user].append({"role": "assistant", "content": reply})
+
+        return reply
+
     except requests.Timeout:
-        return f"{BOT_NAME}思考太投入了，请再问一次吧~ 😅"
+        logger.warning(f"Mimo 超时 | user={from_user} | msg={user_message[:40]}")
+        return f"🕐 {BOT_NAME}没来得及想好，请再发一次～"
     except Exception as e:
-        return f"抱歉，小爪暂时走神了，请稍后再试~ 😅"
+        logger.error(f"Mimo 调用失败: {e} | user={from_user}")
+        return "抱歉，小爪暂时走神了，请稍后再试～ 😅"
 
 
-def call_mimo_with_image(text, image_url):
-    """调用 Mimo API 生成回复（文本 + 图片）
-    使用 OpenAI 兼容的 vision 格式发送图片链接
-    """
+def call_mimo_with_image(from_user: str, text: str, image_url: str) -> str:
+    """图片消息（vision 场景不带历史上下文）"""
     headers = {
         "Authorization": f"Bearer {MIMO_API_KEY}",
         "Content-Type": "application/json"
     }
-    # 构建多模态消息内容（text + image_url）
-    content = [
-        {"type": "text", "text": text or "请描述这张图片"},
-        {"type": "image_url", "image_url": {"url": image_url}}
-    ]
     payload = {
         "model": "mimo-v2.5",
         "messages": [
-            {
-                "role": "system",
-                "content": f"你是一个友好的AI助手，名字叫{BOT_NAME}。你正在一个微信公众号里和用户对话。"
-                           f"你会收到文字和图片，请根据用户的问题或图片内容回复。回复不要太长，最好在200字以内。"
-            },
-            {
-                "role": "user",
-                "content": content
-            }
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": [
+                {"type": "text", "text": text or "请描述这张图片"},
+                {"type": "image_url", "image_url": {"url": image_url}}
+            ]}
         ],
         "max_tokens": 500,
         "temperature": 0.8
@@ -142,16 +140,25 @@ def call_mimo_with_image(text, image_url):
     try:
         resp = requests.post(MIMO_API_URL, headers=headers, json=payload, timeout=MIMO_TIMEOUT)
         resp.raise_for_status()
-        data = resp.json()
-        if "choices" in data and len(data["choices"]) > 0:
-            return data["choices"][0]["message"]["content"]
-        # 如果返回的不是标准格式，可能是不支持 vision
-        return "小爪看到了图片，但暂时认不出来是什么 😅"
+        return resp.json()["choices"][0]["message"]["content"]
     except requests.Timeout:
-        return f"{BOT_NAME}看图思考太投入了，请再发一次试试~ 😅"
-    except Exception:
-        # vision 可能不被支持，降级回复
-        return "小爪看到你的图片了！如果 Mimo 支持看图，下次就能识别啦 😊"
+        logger.warning(f"Mimo 图片超时 | user={from_user}")
+        return f"🕐 {BOT_NAME}看图太认真了，请再发一次～"
+    except Exception as e:
+        logger.error(f"Mimo 图片调用失败: {e} | user={from_user}")
+        return "小爪看到你的图片了，但暂时识别不了，请稍后再试～ 😅"
+
+
+# ---------- 指令处理 ----------
+
+def handle_command(cmd: str, from_user: str) -> str | None:
+    """返回 None 表示不是指令"""
+    if cmd == "/clear":
+        user_histories[from_user].clear()
+        return "✅ 对话记忆已清除，咱们重新开始！"
+    if cmd == "/help":
+        return "📋 支持的指令：\n/clear - 清除对话记忆\n/help - 查看帮助"
+    return None
 
 
 # ---------- 路由 ----------
@@ -163,7 +170,6 @@ def index():
 
 @app.route("/wx", methods=["GET"])
 def wechat_verify():
-    """微信服务器验证 - 开发者配置时需要"""
     signature = request.args.get("signature")
     timestamp = request.args.get("timestamp")
     nonce = request.args.get("nonce")
@@ -172,57 +178,58 @@ def wechat_verify():
     if not all([signature, timestamp, nonce]):
         return "error", 400
 
-    l = sorted([WECHAT_TOKEN, timestamp, nonce])
-    real_sig = hashlib.sha1("".join(l).encode()).hexdigest()
-
-    if real_sig == signature and echostr:
-        return make_response(echostr)
-    elif real_sig == signature:
-        return "verify ok"
+    real_sig = hashlib.sha1("".join(sorted([WECHAT_TOKEN, timestamp, nonce])).encode()).hexdigest()
+    if real_sig == signature:
+        return make_response(echostr or "verify ok")
     return "error", 400
 
 
 @app.route("/wx", methods=["POST"])
 def wechat_message():
-    """接收微信消息并回复"""
     if not verify_wechat():
         return "error", 403
 
-    # 初始 fallback 变量
     from_user = "unknown"
     reply = "收到消息了，但处理时遇到了一点小问题 😅"
 
     try:
-        xml_data = request.data
-        root = ET.fromstring(xml_data)
+        root = ET.fromstring(request.data)
         msg_type = root.find("MsgType").text
         from_user = root.find("FromUserName").text
-        content_elem = root.find("Content")
-        content = content_elem.text if content_elem is not None else ""
+        msg_id = root.findtext("MsgId", "")
 
+        # ---- 去重：微信超时会重试，同一 MsgId 只处理一次 ----
+        if msg_id and msg_id in processed_msg_ids:
+            logger.info(f"重复消息，跳过 | MsgId={msg_id}")
+            return "success"  # 返回 success 让微信停止重试
+        if msg_id:
+            processed_msg_ids.add(msg_id)
+            # 防止 set 无限增长，超过 10000 条清一半
+            if len(processed_msg_ids) > 10000:
+                for _ in range(5000):
+                    processed_msg_ids.pop()
+
+        # ---- 消息分发 ----
         if msg_type == "text":
-            user_text = content.strip()
-            if not user_text:
-                reply = "小爪没听清楚你说啥，再发一次？ 😄"
+            content = (root.findtext("Content") or "").strip()
+            if not content:
+                reply = "小爪没听清楚，再说一次？😄"
             else:
-                reply = call_mimo(user_text)
+                # 指令优先
+                cmd_reply = handle_command(content, from_user)
+                reply = cmd_reply if cmd_reply is not None else call_mimo(from_user, content)
+
         elif msg_type == "image":
-            # 处理图片消息
-            pic_url_elem = root.find("PicUrl")
-            pic_url = pic_url_elem.text if pic_url_elem is not None else ""
-            if pic_url:
-                # 用户文字是空的（微信图片消息不带文字），用默认 prompt
-                reply = call_mimo_with_image("请描述一下这张图片", pic_url)
-            else:
-                reply = "小爪收到图片了，但没找到图片地址 😅"
+            pic_url = root.findtext("PicUrl", "")
+            reply = call_mimo_with_image(from_user, "请描述这张图片", pic_url) if pic_url \
+                else "小爪收到图片了，但没找到图片地址 😅"
+
         else:
-            reply = f"小爪还在学习中，暂不支持{msg_type}类型的消息哦~ 😅"
+            reply = f"小爪还在学习中，暂不支持「{msg_type}」类消息～ 😅"
 
     except Exception as e:
-        # 如果连 from_user 都没解析出来，已经由外层的默认值兜底了
-        app.logger.error(f"消息处理异常: {e}")
+        logger.error(f"消息处理异常: {e}")
 
-    # 统一构建响应
     response = make_response(reply_text(from_user, reply))
     response.content_type = "text/xml; charset=utf-8"
     return response
@@ -230,5 +237,5 @@ def wechat_message():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"🤖 {BOT_NAME} 启动中，端口：{port}")
+    logger.info(f"🤖 {BOT_NAME} 启动，端口：{port}")
     app.run(host="0.0.0.0", port=port)
