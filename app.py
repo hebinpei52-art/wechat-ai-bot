@@ -74,7 +74,7 @@ def reply_text(to_user, content):
 # ---------- Mimo API ----------
 
 def call_mimo(user_message):
-    """调用 Mimo API 生成回复"""
+    """调用 Mimo API 生成回复（纯文本）"""
     headers = {
         "Authorization": f"Bearer {MIMO_API_KEY}",
         "Content-Type": "application/json"
@@ -107,6 +107,51 @@ def call_mimo(user_message):
         return f"{BOT_NAME}思考太投入了，请再问一次吧~ 😅"
     except Exception as e:
         return f"抱歉，小爪暂时走神了，请稍后再试~ 😅"
+
+
+def call_mimo_with_image(text, image_url):
+    """调用 Mimo API 生成回复（文本 + 图片）
+    使用 OpenAI 兼容的 vision 格式发送图片链接
+    """
+    headers = {
+        "Authorization": f"Bearer {MIMO_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    # 构建多模态消息内容（text + image_url）
+    content = [
+        {"type": "text", "text": text or "请描述这张图片"},
+        {"type": "image_url", "image_url": {"url": image_url}}
+    ]
+    payload = {
+        "model": "mimo-v2.5",
+        "messages": [
+            {
+                "role": "system",
+                "content": f"你是一个友好的AI助手，名字叫{BOT_NAME}。你正在一个微信公众号里和用户对话。"
+                           f"你会收到文字和图片，请根据用户的问题或图片内容回复。回复不要太长，最好在200字以内。"
+            },
+            {
+                "role": "user",
+                "content": content
+            }
+        ],
+        "max_tokens": 500,
+        "temperature": 0.8
+    }
+
+    try:
+        resp = requests.post(MIMO_API_URL, headers=headers, json=payload, timeout=MIMO_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        if "choices" in data and len(data["choices"]) > 0:
+            return data["choices"][0]["message"]["content"]
+        # 如果返回的不是标准格式，可能是不支持 vision
+        return "小爪看到了图片，但暂时认不出来是什么 😅"
+    except requests.Timeout:
+        return f"{BOT_NAME}看图思考太投入了，请再发一次试试~ 😅"
+    except Exception:
+        # vision 可能不被支持，降级回复
+        return "小爪看到你的图片了！如果 Mimo 支持看图，下次就能识别啦 😊"
 
 
 # ---------- 路由 ----------
@@ -161,6 +206,15 @@ def wechat_message():
                 reply = "小爪没听清楚你说啥，再发一次？ 😄"
             else:
                 reply = call_mimo(user_text)
+        elif msg_type == "image":
+            # 处理图片消息
+            pic_url_elem = root.find("PicUrl")
+            pic_url = pic_url_elem.text if pic_url_elem is not None else ""
+            if pic_url:
+                # 用户文字是空的（微信图片消息不带文字），用默认 prompt
+                reply = call_mimo_with_image("请描述一下这张图片", pic_url)
+            else:
+                reply = "小爪收到图片了，但没找到图片地址 😅"
         else:
             reply = f"小爪还在学习中，暂不支持{msg_type}类型的消息哦~ 😅"
 
